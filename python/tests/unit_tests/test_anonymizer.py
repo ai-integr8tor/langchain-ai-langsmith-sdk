@@ -255,35 +255,6 @@ def test_secret_anonymizer_redacts_pgp_block():
     assert redact({"file": block}) == {"file": SECRET_PLACEHOLDER}
 
 
-def test_secret_anonymizer_preserves_bearer_scheme():
-    # Parity with the JS preset: keep the "Bearer " scheme, redact the token.
-    redact = create_secret_anonymizer()
-    assert (
-        redact("Authorization: Bearer aB3xY7zQ1234567890")
-        == f"Authorization: Bearer {SECRET_PLACEHOLDER}"
-    )
-
-
-def test_secret_anonymizer_structural_rules():
-    redact = create_secret_anonymizer()
-    assert (
-        redact("MY_SERVICE_TOKEN=abcdef1234567890")
-        == f"MY_SERVICE_TOKEN={SECRET_PLACEHOLDER}"
-    )
-    assert (
-        redact('{"api_key": "abcdef1234567890"}')
-        == f'{{"api_key": "{SECRET_PLACEHOLDER}"}}'
-    )
-    assert (
-        redact("header: Bearer aB3xY7zQ1234567890")
-        == f"header: Bearer {SECRET_PLACEHOLDER}"
-    )
-    assert (
-        redact("postgres://user:sup3rs3cretpw@db.example.com:5432/app")
-        == f"postgres://user:{SECRET_PLACEHOLDER}@db.example.com:5432/app"
-    )
-
-
 @pytest.mark.parametrize(
     "value",
     [
@@ -291,47 +262,17 @@ def test_secret_anonymizer_structural_rules():
         "e83c5163316f89bfbde7d9ab23ca2e25604af290",  # 40-char git SHA
         "total = compute_sum(items) + 42",  # ordinary code
         "The deployment finished successfully in 12 seconds.",  # prose
-        "count=5",  # short, non-sensitive assignment
-        'description="a reasonably long human description"',  # non-sensitive name
-        'tokenizer: "cl100k_base"',  # "token" must not match mid-word
-        "tokens_used: 123456",  # keyword as a prefix of a longer word
+        'tokenizer: "cl100k_base"',  # no provider-key prefix
+        "tokens_used: 123456",  # no provider-key prefix
+        "MY_SERVICE_TOKEN=abcdef1234567890",  # structural rule removed
+        '{"api_key": "abcdef1234567890"}',  # structural rule removed
+        "Authorization: Bearer aB3xY7zQ1234567890",  # structural rule removed
+        "postgres://user:sup3rs3cretpw@db.example.com:5432/app",  # structural rule removed
     ],
 )
 def test_secret_anonymizer_precision_guards(value):
     redact = create_secret_anonymizer()
     assert redact(value) == value
-
-
-def test_secret_anonymizer_redacts_credential_after_scheme_word():
-    # The structural api-key rule must not stop at "Bearer" and leave the token.
-    redact = create_secret_anonymizer()
-    out = redact("X-Api-Key: Bearer tok_abcdefghij")
-    assert "tok_abcdefghij" not in out
-    assert out == f"X-Api-Key: {SECRET_PLACEHOLDER}"
-
-
-def test_secret_anonymizer_stops_at_query_separators():
-    redact = create_secret_anonymizer()
-    assert (
-        redact("/api?api_key=ABCDEF123456&user=bob")
-        == f"/api?api_key={SECRET_PLACEHOLDER}&user=bob"
-    )
-
-
-def test_secret_anonymizer_redacts_empty_username_connection_string():
-    redact = create_secret_anonymizer()
-    assert (
-        redact("redis://:sup3rs3cretpw@host:6379")
-        == f"redis://:{SECRET_PLACEHOLDER}@host:6379"
-    )
-
-
-def test_secret_anonymizer_redacts_lowercase_bare_bearer():
-    redact = create_secret_anonymizer()
-    assert (
-        redact("sent bearer aB3xY7zQ1234567890 here")
-        == f"sent bearer {SECRET_PLACEHOLDER} here"
-    )
 
 
 def test_secret_anonymizer_nested_payload():
@@ -403,3 +344,225 @@ def test_secret_anonymizer_in_traceable():
     assert aws_key not in blob
     assert anthropic_key not in blob
     assert SECRET_PLACEHOLDER in blob
+
+
+# ── default-on secret redaction (no explicit anonymizer) ─────────────────────
+
+
+def _make_mock_client(**kwargs) -> Client:
+    return Client(
+        session=MagicMock(),
+        auto_batch_tracing=False,
+        api_url="http://localhost:1984",
+        api_key="123",
+        **kwargs,
+    )
+
+
+def test_default_redact_secrets_on():
+    """Secrets are redacted by default with no explicit anonymizer."""
+    client = _make_mock_client()
+    aws_key = "AKIA" + "IOSFODNN7EXAMPLE"
+    anthropic_key = "sk-ant-api03-" + "A" * 30
+
+    @traceable(client=client)
+    def my_func(api_key: str) -> dict:
+        return {"note": f"leaked {anthropic_key} here"}
+
+    with tracing_context(enabled=True):
+        my_func(aws_key)
+
+    posts = [
+        json.loads(call[2]["data"])
+        for call in client.session.request.mock_calls
+        if call.args and call.args[1].endswith("runs")
+    ]
+    assert len(posts) == 1
+    blob = json.dumps(posts[0])
+    assert aws_key not in blob
+    assert anthropic_key not in blob
+    assert SECRET_PLACEHOLDER in blob
+
+
+def test_redact_secrets_disabled_by_constructor():
+    """redact_secrets=False opts out of default redaction."""
+    client = _make_mock_client(redact_secrets=False)
+    aws_key = "AKIA" + "IOSFODNN7EXAMPLE"
+
+    @traceable(client=client)
+    def my_func(api_key: str) -> dict:
+        return {"note": "no secrets here"}
+
+    with tracing_context(enabled=True):
+        my_func(aws_key)
+
+    posts = [
+        json.loads(call[2]["data"])
+        for call in client.session.request.mock_calls
+        if call.args and call.args[1].endswith("runs")
+    ]
+    assert len(posts) == 1
+    # Without redaction, the key passes through untouched.
+    assert aws_key in json.dumps(posts[0])
+    assert SECRET_PLACEHOLDER not in json.dumps(posts[0])
+
+
+def test_custom_anonymizer_takes_precedence_over_redact_secrets():
+    """A custom anonymizer overrides the default secret redaction."""
+    custom = create_anonymizer(
+        [StringNodeRule(pattern=re.compile(r"REPLACE_ME"), replace="[done]")]
+    )
+    client = _make_mock_client(anonymizer=custom)
+
+    @traceable(client=client)
+    def my_func() -> dict:
+        return {"note": "leaked REPLACE_ME and sk-ant-api03-" + "A" * 30}
+
+    with tracing_context(enabled=True):
+        my_func()
+
+    posts = [
+        json.loads(call[2]["data"])
+        for call in client.session.request.mock_calls
+        if call.args and call.args[1].endswith("runs")
+    ]
+    patches = [
+        json.loads(call[2]["data"])
+        for call in client.session.request.mock_calls
+        if call.args
+        and cast(str, call.args[0]).lower() == "patch"
+        and "/runs" in call.args[1]
+    ]
+    blob = json.dumps(posts + patches)
+    # Custom anonymizer ran, but the secret was NOT redacted (it's not the
+    # secret preset).
+    assert "[done]" in blob
+    assert "sk-ant-api03-" + "A" * 30 in blob
+
+
+def test_default_redact_secrets_applies_to_metadata():
+    """The default anonymizer also redacts secrets in run metadata."""
+    client = _make_mock_client()
+    api_key = "sk-ant-api03-" + "A" * 30
+
+    @traceable(client=client, metadata={"config": f"key={api_key}"})
+    def my_func() -> dict:
+        return {"ok": True}
+
+    with tracing_context(enabled=True):
+        my_func()
+
+    posts = [
+        json.loads(call[2]["data"])
+        for call in client.session.request.mock_calls
+        if call.args and call.args[1].endswith("runs")
+    ]
+    assert len(posts) == 1
+    blob = json.dumps(posts[0])
+    assert api_key not in blob
+    assert SECRET_PLACEHOLDER in blob
+
+
+def test_redact_secrets_env_var_opt_out(monkeypatch):
+    """LANGSMITH_REDACT_SECRETS=false disables default redaction."""
+    from langsmith import utils as ls_utils
+
+    ls_utils.get_env_var.cache_clear()
+    monkeypatch.setenv("LANGSMITH_REDACT_SECRETS", "false")
+    client = _make_mock_client()
+    aws_key = "AKIA" + "IOSFODNN7EXAMPLE"
+
+    @traceable(client=client)
+    def my_func(api_key: str) -> dict:
+        return {"note": "no secrets here"}
+
+    with tracing_context(enabled=True):
+        my_func(aws_key)
+
+    posts = [
+        json.loads(call[2]["data"])
+        for call in client.session.request.mock_calls
+        if call.args and call.args[1].endswith("runs")
+    ]
+    assert len(posts) == 1
+    assert aws_key in json.dumps(posts[0])
+    assert SECRET_PLACEHOLDER not in json.dumps(posts[0])
+    ls_utils.get_env_var.cache_clear()
+
+
+def test_redact_secrets_env_var_overridden_by_constructor(monkeypatch):
+    """Constructor redact_secrets=True overrides LANGSMITH_REDACT_SECRETS=false."""
+    from langsmith import utils as ls_utils
+
+    ls_utils.get_env_var.cache_clear()
+    monkeypatch.setenv("LANGSMITH_REDACT_SECRETS", "false")
+    client = _make_mock_client(redact_secrets=True)
+    anthropic_key = "sk-ant-api03-" + "A" * 30
+
+    @traceable(client=client)
+    def my_func() -> dict:
+        return {"note": f"leaked {anthropic_key} here"}
+
+    with tracing_context(enabled=True):
+        my_func()
+
+    patches = [
+        json.loads(call[2]["data"])
+        for call in client.session.request.mock_calls
+        if call.args
+        and cast(str, call.args[0]).lower() == "patch"
+        and "/runs" in call.args[1]
+    ]
+    blob = json.dumps(patches)
+    assert anthropic_key not in blob
+    assert SECRET_PLACEHOLDER in blob
+    ls_utils.get_env_var.cache_clear()
+
+
+# ── base64 skip optimization ────────────────────────────────────────────────
+
+
+def test_secret_anonymizer_skips_large_base64_blob():
+    """Large base64 blobs are skipped for performance, but secrets in
+    adjacent text fields are still redacted."""
+    from langsmith.anonymizer import _is_likely_base64
+
+    # A large base64 blob (simulated image data)
+    blob = "A" * 5000  # long, pure base64 alphabet
+    assert _is_likely_base64(blob) is True
+
+    redact = create_secret_anonymizer()
+    payload = {
+        "image_data": blob,
+        "text": f"Here is a secret: sk-ant-api03-{'A' * 30}",
+    }
+    result = redact(payload)
+    # Base64 blob is untouched
+    assert result["image_data"] == blob
+    # Secret in text field is still redacted
+    assert SECRET_PLACEHOLDER in result["text"]
+
+
+def test_secret_anonymizer_does_not_skip_short_strings():
+    """Short strings are never classified as base64, even if they look base64."""
+    from langsmith.anonymizer import _is_likely_base64
+
+    assert _is_likely_base64("short") is False
+    assert _is_likely_base64("A" * 99) is False
+    assert _is_likely_base64("A" * 100) is True
+
+
+def test_secret_anonymizer_skips_base64_with_whitespace():
+    """Base64 blobs with newlines (common in PEM-like data) are still skipped."""
+    from langsmith.anonymizer import _is_likely_base64
+
+    blob = ("A" * 76 + "\n") * 10  # 760 chars + newlines
+    assert _is_likely_base64(blob) is True
+
+
+def test_secret_anonymizer_does_not_flag_prose_as_base64():
+    """Normal text with spaces and punctuation is not flagged as base64."""
+    from langsmith.anonymizer import _is_likely_base64
+
+    text = "The quick brown fox jumps over the lazy dog. " * 20
+    assert _is_likely_base64(text) is False

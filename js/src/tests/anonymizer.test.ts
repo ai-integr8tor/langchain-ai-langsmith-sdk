@@ -1,9 +1,11 @@
+/* eslint-disable no-process-env */
 import {
   StringNodeRule,
   createAnonymizer,
   createSecretAnonymizer,
   DEFAULT_SECRET_RULES,
   SECRET_PLACEHOLDER,
+  isLikelyBase64,
 } from "../anonymizer/index.js";
 import { v4 as uuid } from "../utils/uuid/src/index.js";
 import { traceable } from "../traceable.js";
@@ -257,42 +259,18 @@ describe("createSecretAnonymizer", () => {
     expect(out.file).toBe(SECRET_PLACEHOLDER);
   });
 
-  describe("structural rules", () => {
-    test("redacts the value of a sensitive assignment, keeps the name", () => {
-      const out = redact("MY_SERVICE_TOKEN=abcdef1234567890") as string;
-      expect(out).toBe(`MY_SERVICE_TOKEN=${SECRET_PLACEHOLDER}`);
-    });
-
-    test("redacts a quoted JSON secret value", () => {
-      const out = redact('{"api_key": "abcdef1234567890"}') as string;
-      expect(out).toBe(`{"api_key": "${SECRET_PLACEHOLDER}"}`);
-    });
-
-    test("redacts bare Bearer tokens", () => {
-      const out = redact("header: Bearer aB3xY7zQ1234567890") as string;
-      expect(out).toBe(`header: Bearer ${SECRET_PLACEHOLDER}`);
-    });
-
-    test("redacts the password in a connection string", () => {
-      const out = redact(
-        "postgres://user:sup3rs3cretpw@db.example.com:5432/app",
-      ) as string;
-      expect(out).toBe(
-        `postgres://user:${SECRET_PLACEHOLDER}@db.example.com:5432/app`,
-      );
-    });
-  });
-
   describe("precision guards (must NOT be redacted)", () => {
     const SAFE = [
       "123e4567-e89b-12d3-a456-426614174000", // UUID
       "e83c5163316f89bfbde7d9ab23ca2e25604af290", // 40-char git SHA
       "const total = computeSum(items) + 42;", // ordinary code
       "The deployment finished successfully in 12 seconds.", // prose
-      "count=5", // short, non-sensitive assignment
-      'description="a reasonably long human description"', // non-sensitive name
-      'tokenizer: "cl100k_base"', // "token" must not match mid-word
-      "tokens_used: 123456", // keyword as a prefix of a longer word
+      'tokenizer: "cl100k_base"', // no provider-key prefix
+      "tokens_used: 123456", // no provider-key prefix
+      "MY_SERVICE_TOKEN=abcdef1234567890", // structural rule removed
+      '{"api_key": "abcdef1234567890"}', // structural rule removed
+      "Authorization: Bearer aB3xY7zQ1234567890", // structural rule removed
+      "postgres://user:sup3rs3cretpw@db.example.com:5432/app", // structural rule removed
     ];
     test.each(SAFE)("leaves %s untouched", (value) => {
       expect(redact(value)).toBe(value);
@@ -314,37 +292,6 @@ describe("createSecretAnonymizer", () => {
     const block = [begin, "a".repeat(64), end].join("\n");
     expect((redact({ file: block }) as { file: string }).file).toBe(
       SECRET_PLACEHOLDER,
-    );
-  });
-
-  test("preserves the Bearer scheme in Authorization headers (parity)", () => {
-    expect(redact("Authorization: Bearer aB3xY7zQ1234567890")).toBe(
-      `Authorization: Bearer ${SECRET_PLACEHOLDER}`,
-    );
-  });
-
-  test("redacts the credential after a scheme word in X-Api-Key", () => {
-    // The structural api-key rule must not stop at "Bearer" and leave the token.
-    const out = redact("X-Api-Key: Bearer tok_abcdefghij") as string;
-    expect(out).not.toContain("tok_abcdefghij");
-    expect(out).toBe(`X-Api-Key: ${SECRET_PLACEHOLDER}`);
-  });
-
-  test("stops the redacted value at query-string separators", () => {
-    expect(redact("/api?api_key=ABCDEF123456&user=bob")).toBe(
-      `/api?api_key=${SECRET_PLACEHOLDER}&user=bob`,
-    );
-  });
-
-  test("redacts the password in a connection string with empty username", () => {
-    expect(redact("redis://:sup3rs3cretpw@host:6379")).toBe(
-      `redis://:${SECRET_PLACEHOLDER}@host:6379`,
-    );
-  });
-
-  test("redacts a lowercase bare bearer token, preserving the scheme word", () => {
-    expect(redact("sent bearer aB3xY7zQ1234567890 here")).toBe(
-      `sent bearer ${SECRET_PLACEHOLDER} here`,
     );
   });
 
@@ -412,5 +359,226 @@ describe("createSecretAnonymizer", () => {
     expect(JSON.stringify(data.inputs)).toContain(SECRET_PLACEHOLDER);
     expect(JSON.stringify(data.inputs)).not.toContain("AKIAIOSFODNN7EXAMPLE");
     expect(JSON.stringify(data.outputs)).toContain(SECRET_PLACEHOLDER);
+  });
+});
+
+// ── default-on secret redaction (no explicit anonymizer) ─────────────────────
+
+describe("default secret redaction", () => {
+  const AWS_KEY = "AKIAIOSFODNN7EXAMPLE";
+  const ANTHROPIC_KEY = `sk-ant-api03-${"A".repeat(30)}`;
+
+  test("redacts secrets by default with no explicit anonymizer", async () => {
+    const { client, callSpy } = mockClient({});
+
+    const fn = traceable(
+      async (_apiKey: string) => ({
+        note: `leaked ${ANTHROPIC_KEY} here`,
+      }),
+      { client, name: "fn", tracingEnabled: true },
+    );
+
+    await fn(AWS_KEY);
+
+    const tree = await getAssumedTreeFromCalls(callSpy.mock.calls, client);
+    const blob = JSON.stringify(tree);
+    expect(blob).not.toContain(AWS_KEY);
+    expect(blob).not.toContain(ANTHROPIC_KEY);
+    expect(blob).toContain(SECRET_PLACEHOLDER);
+  });
+
+  test("redactSecrets: false opts out of default redaction", async () => {
+    const { client, callSpy } = mockClient({ redactSecrets: false });
+
+    const fn = traceable(
+      async (_apiKey: string) => ({ note: "no secrets here" }),
+      { client, name: "fn", tracingEnabled: true },
+    );
+
+    await fn(AWS_KEY);
+
+    const tree = await getAssumedTreeFromCalls(callSpy.mock.calls, client);
+    const blob = JSON.stringify(tree);
+    // Without redaction, the key passes through untouched.
+    expect(blob).toContain(AWS_KEY);
+    expect(blob).not.toContain(SECRET_PLACEHOLDER);
+  });
+
+  test("custom anonymizer takes precedence over redactSecrets", async () => {
+    const custom = createAnonymizer([
+      { pattern: /REPLACE_ME/g, replace: "[done]" },
+    ]);
+    const { client, callSpy } = mockClient({ anonymizer: custom });
+
+    const fn = traceable(
+      async () => ({
+        note: `leaked REPLACE_ME and ${ANTHROPIC_KEY}`,
+      }),
+      { client, name: "fn", tracingEnabled: true },
+    );
+
+    await fn();
+
+    const tree = await getAssumedTreeFromCalls(callSpy.mock.calls, client);
+    const blob = JSON.stringify(tree);
+    // Custom anonymizer ran, but the secret was NOT redacted.
+    expect(blob).toContain("[done]");
+    expect(blob).toContain(ANTHROPIC_KEY);
+  });
+
+  test("default redaction also applies to metadata", async () => {
+    const { client, callSpy } = mockClient({});
+
+    const fn = traceable(async () => ({ ok: true }), {
+      client,
+      name: "fn",
+      tracingEnabled: true,
+      metadata: { config: `key=${ANTHROPIC_KEY}` },
+    });
+
+    await fn();
+
+    const tree = await getAssumedTreeFromCalls(callSpy.mock.calls, client);
+    const blob = JSON.stringify(tree);
+    expect(blob).not.toContain(ANTHROPIC_KEY);
+    expect(blob).toContain(SECRET_PLACEHOLDER);
+  });
+
+  test("LANGSMITH_REDACT_SECRETS=false disables default redaction", async () => {
+    const original = process.env.LANGSMITH_REDACT_SECRETS;
+    process.env.LANGSMITH_REDACT_SECRETS = "false";
+    try {
+      const { client, callSpy } = mockClient({});
+
+      const fn = traceable(
+        async (_apiKey: string) => ({ note: "no secrets here" }),
+        { client, name: "fn", tracingEnabled: true },
+      );
+
+      await fn(AWS_KEY);
+
+      const tree = await getAssumedTreeFromCalls(callSpy.mock.calls, client);
+      const blob = JSON.stringify(tree);
+      expect(blob).toContain(AWS_KEY);
+      expect(blob).not.toContain(SECRET_PLACEHOLDER);
+    } finally {
+      if (original === undefined) {
+        delete process.env.LANGSMITH_REDACT_SECRETS;
+      } else {
+        process.env.LANGSMITH_REDACT_SECRETS = original;
+      }
+    }
+  });
+
+  test("constructor redactSecrets: true overrides env var false", async () => {
+    const original = process.env.LANGSMITH_REDACT_SECRETS;
+    process.env.LANGSMITH_REDACT_SECRETS = "false";
+    try {
+      const { client, callSpy } = mockClient({ redactSecrets: true });
+
+      const fn = traceable(
+        async () => ({ note: `leaked ${ANTHROPIC_KEY} here` }),
+        { client, name: "fn", tracingEnabled: true },
+      );
+
+      await fn();
+
+      const tree = await getAssumedTreeFromCalls(callSpy.mock.calls, client);
+      const blob = JSON.stringify(tree);
+      expect(blob).not.toContain(ANTHROPIC_KEY);
+      expect(blob).toContain(SECRET_PLACEHOLDER);
+    } finally {
+      if (original === undefined) {
+        delete process.env.LANGSMITH_REDACT_SECRETS;
+      } else {
+        process.env.LANGSMITH_REDACT_SECRETS = original;
+      }
+    }
+  });
+
+  test("LANGSMITH_HIDE_INPUTS=true fully hides inputs instead of redacting", async () => {
+    const original = process.env.LANGSMITH_HIDE_INPUTS;
+    process.env.LANGSMITH_HIDE_INPUTS = "true";
+    try {
+      const { client, callSpy } = mockClient({});
+
+      const fn = traceable(
+        async (_params: Record<string, unknown>) => ({ note: "ok" }),
+        {
+          client,
+          name: "fn",
+          tracingEnabled: true,
+        },
+      );
+
+      await fn({ password: "supersecret123", other: "visible" });
+
+      const tree = await getAssumedTreeFromCalls(callSpy.mock.calls, client);
+      const data = tree.data["fn:0"] as {
+        inputs: Record<string, unknown>;
+      };
+      // With HIDE_INPUTS=true, inputs should be {} (fully hidden), not redacted.
+      expect(data.inputs).toEqual({});
+      // The raw value must not appear anywhere.
+      expect(JSON.stringify(tree)).not.toContain("supersecret123");
+    } finally {
+      if (original === undefined) {
+        delete process.env.LANGSMITH_HIDE_INPUTS;
+      } else {
+        process.env.LANGSMITH_HIDE_INPUTS = original;
+      }
+    }
+  });
+
+  test("does not throw when extra.metadata is undefined", async () => {
+    const { client } = mockClient({});
+
+    // Directly call createRun with extra.metadata present but undefined.
+    // Before the fix, the default anonymizer would throw on
+    // JSON.parse(JSON.stringify(undefined)).
+    await expect(
+      client.createRun({
+        name: "test-undefined-metadata",
+        inputs: { value: "ok" },
+        run_type: "chain",
+        extra: { metadata: undefined },
+      }),
+    ).resolves.not.toThrow();
+  });
+});
+
+// ── base64 skip optimization ────────────────────────────────────────────────
+
+describe("base64 skip optimization", () => {
+  test("skips large base64 blobs but still redacts secrets in adjacent text", () => {
+    const redact = createSecretAnonymizer();
+    const blob = "A".repeat(5000); // long, pure base64 alphabet
+    const anthropicKey = `sk-ant-api03-${"A".repeat(30)}`;
+    const payload = {
+      image_data: blob,
+      text: `Here is a secret: ${anthropicKey}`,
+    };
+    const result = redact(payload) as Record<string, string>;
+    // Base64 blob is untouched
+    expect(result.image_data).toBe(blob);
+    // Secret in text field is still redacted
+    expect(result.text).toContain(SECRET_PLACEHOLDER);
+    expect(result.text).not.toContain(anthropicKey);
+  });
+
+  test("short strings are never classified as base64", () => {
+    expect(isLikelyBase64("short")).toBe(false);
+    expect(isLikelyBase64("A".repeat(99))).toBe(false);
+    expect(isLikelyBase64("A".repeat(100))).toBe(true);
+  });
+
+  test("base64 blobs with newlines are still skipped", () => {
+    const blob = ("A".repeat(76) + "\n").repeat(10); // 760 chars + newlines
+    expect(isLikelyBase64(blob)).toBe(true);
+  });
+
+  test("prose with spaces and punctuation is not flagged as base64", () => {
+    const text = "The quick brown fox jumps over the lazy dog. ".repeat(20);
+    expect(isLikelyBase64(text)).toBe(false);
   });
 });

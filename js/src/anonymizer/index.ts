@@ -1,62 +1,67 @@
+import { serialize as serializePayloadForTracing } from "../utils/fast-safe-stringify/index.js";
+
+const textDecoder = new TextDecoder();
+
 export interface StringNode {
   value: string;
   path: string;
 }
 
 interface StringNodeInternal extends StringNode {
-  // Direct reference to the parent object and key, so we can write back
-  // without path parsing/traversal (avoids prototype pollution entirely).
-  parent: Record<string, unknown>;
-  key: string;
   // Unique identity for matching after maskNodes processing.
   _id: number;
+  // Internal path segments from the original traversal. This lets us apply
+  // updates to a clone without parsing the public dotted path string.
+  pathParts: string[];
 }
 
 function extractStringNodes(data: unknown, options: { maxDepth?: number }) {
   const parsedOptions = { ...options, maxDepth: options.maxDepth ?? 10 };
+  const seen = new WeakSet<object>();
 
   const queue: [
     value: unknown,
     depth: number,
     path: string,
-    parent: Record<string, unknown> | null,
-    key: string,
-  ][] = [[data, 0, "", null, ""]];
+    pathParts: string[],
+  ][] = [[data, 0, "", []]];
 
   let nextId = 0;
   const result: StringNodeInternal[] = [];
-  while (queue.length > 0) {
-    const task = queue.shift();
+  let queueIndex = 0;
+  while (queueIndex < queue.length) {
+    const task = queue[queueIndex++];
     if (task == null) continue;
-    const [value, depth, path, parent, key] = task;
+    const [value, depth, path, pathParts] = task;
     if (typeof value === "string") {
       result.push({
         value,
         path,
-        parent: parent as Record<string, unknown>,
-        key,
         _id: nextId++,
+        pathParts,
       });
     } else if (Array.isArray(value)) {
       if (depth >= parsedOptions.maxDepth) continue;
+      if (seen.has(value)) continue;
+      seen.add(value);
       for (let i = 0; i < value.length; i++) {
         queue.push([
           value[i],
           depth + 1,
           `${path}[${i}]`,
-          value as unknown as Record<string, unknown>,
-          String(i),
+          [...pathParts, String(i)],
         ]);
       }
     } else if (typeof value === "object" && value != null) {
       if (depth >= parsedOptions.maxDepth) continue;
+      if (seen.has(value)) continue;
+      seen.add(value);
       for (const [k, nestedValue] of Object.entries(value)) {
         queue.push([
           nestedValue,
           depth + 1,
           path ? `${path}.${k}` : k,
-          value as Record<string, unknown>,
-          k,
+          [...pathParts, k],
         ]);
       }
     }
@@ -66,7 +71,7 @@ function extractStringNodes(data: unknown, options: { maxDepth?: number }) {
 }
 
 function deepClone<T>(data: T): T {
-  return JSON.parse(JSON.stringify(data));
+  return JSON.parse(textDecoder.decode(serializePayloadForTracing(data)));
 }
 
 export interface StringNodeProcessor {
@@ -84,92 +89,191 @@ export type ReplacerType =
   | StringNodeRule[]
   | StringNodeProcessor;
 
+// ── Combined-alternation optimization ─────────────────────────────────────
+// When a rule set contains many patterns that all share the same replacement
+// string and don't use capture groups, we can combine them into a single
+// alternation regex: `(?:pat1|pat2|pat3|...)`. This lets the engine do one
+// pass over the string instead of N, reducing per-string overhead from N
+// replace() calls to 1.
+//
+// The secret anonymizer applies this optimization inside the node-based
+// pipeline: each string node is prefiltered (skipping large base64 blobs and
+// strings with no secret indicators), then matched against the combined regex.
+
+type SimpleRule = { source: string; flags: string; replace: string };
+type StructuralRule = { regex: RegExp; replace: string };
+
+function partitionRules(
+  rules: StringNodeRule[],
+): { simple: Map<string, SimpleRule[]>; structural: StructuralRule[] } {
+  const simple = new Map<string, SimpleRule[]>();
+  const structural: StructuralRule[] = [];
+
+  for (const { pattern, type, replace } of rules) {
+    if (type != null && type !== "pattern")
+      throw new Error("Invalid anonymizer type");
+    const re = typeof pattern === "string" ? new RegExp(pattern, "g") : pattern;
+    const repl = replace ?? "[redacted]";
+    // A rule is "simple" if its replacement is a plain string with no $-refs
+    // AND the pattern has no capture groups (so alternation won't shift
+    // group indices).
+    const hasGroupRef = /\$[1-9]/.test(repl);
+    const hasCaptureGroup = /\((?!\?[:=!]|<)/.test(re.source);
+    if (hasGroupRef || hasCaptureGroup) {
+      structural.push({ regex: re, replace: repl });
+    } else {
+      const key = repl;
+      let group = simple.get(key);
+      if (!group) {
+        group = [];
+        simple.set(key, group);
+      }
+      group.push({ source: re.source, flags: re.flags, replace: repl });
+    }
+  }
+  return { simple, structural };
+}
+
+function combineSimpleRules(
+  groups: Map<string, SimpleRule[]>,
+): { regex: RegExp; replace: string }[] {
+  const result: { regex: RegExp; replace: string }[] = [];
+  for (const [replace, group] of groups) {
+    // All patterns in a group should have compatible flags. We use the
+    // union of flags seen. In practice the secret rules all use "g" or
+    // "gi", and combining is safe.
+    const flagSet = new Set<string>();
+    for (const { flags } of group) {
+      for (const f of flags) flagSet.add(f);
+    }
+    const combinedFlags = [...flagSet].join("");
+    const combined = group.map(({ source }) => `(?:${source})`).join("|");
+    result.push({ regex: new RegExp(combined, combinedFlags), replace });
+  }
+  return result;
+}
+
+function createRuleNodeProcessor(
+  rules: StringNodeRule[],
+  options?: { prefilter?: (value: string) => boolean },
+): StringNodeProcessor {
+  const { simple, structural } = partitionRules(rules);
+  const combined = combineSimpleRules(simple);
+  const allReplacers: { regex: RegExp; replace: string }[] = [
+    ...combined,
+    ...structural,
+  ];
+
+  if (allReplacers.length === 0) throw new Error("No replacers provided");
+
+  return {
+    maskNodes: (nodes: StringNode[]) => {
+      return nodes.reduce<StringNode[]>((memo, item) => {
+        if (options?.prefilter != null && !options.prefilter(item.value)) {
+          return memo;
+        }
+
+        const newValue = allReplacers.reduce((value, { regex, replace }) => {
+          const result = value.replace(regex, replace);
+          // Reset lastIndex for stateful (global) regexes.
+          regex.lastIndex = 0;
+          return result;
+        }, item.value);
+
+        if (newValue !== item.value) {
+          memo.push({ ...item, value: newValue });
+        }
+
+        return memo;
+      }, []);
+    },
+  };
+}
+
+function getNodeProcessor(replacer: ReplacerType): StringNodeProcessor {
+  return Array.isArray(replacer)
+    ? createRuleNodeProcessor(replacer)
+    : typeof replacer === "function"
+      ? {
+          maskNodes: (nodes: StringNode[]) =>
+            nodes.reduce<StringNode[]>((memo, item) => {
+              const newValue = replacer(item.value, item.path);
+              if (newValue !== item.value) {
+                memo.push({ ...item, value: newValue });
+              }
+
+              return memo;
+            }, []),
+        }
+      : replacer;
+}
+
+function applyUpdateAtPath<T>(
+  root: T,
+  pathParts: string[],
+  value: string,
+): void {
+  let target = root as Record<string, unknown>;
+  for (const part of pathParts.slice(0, -1)) {
+    const next = target[part];
+    if (typeof next !== "object" || next == null) {
+      return;
+    }
+    target = next as Record<string, unknown>;
+  }
+  target[pathParts[pathParts.length - 1]] = value;
+}
+
+function applyProcessor<T>(
+  mutateValue: T,
+  processor: StringNodeProcessor,
+  options?: { maxDepth?: number },
+): T {
+  const nodes = extractStringNodes(mutateValue, {
+    maxDepth: options?.maxDepth,
+  });
+  if (nodes.length === 0) {
+    return mutateValue;
+  }
+
+  const toUpdate = processor.maskNodes(nodes);
+  if (toUpdate.length === 0) {
+    return mutateValue;
+  }
+
+  const nodesById = new Map<number, StringNodeInternal>();
+  const nodesByPath = new Map<string, StringNodeInternal>();
+  for (const node of nodes) {
+    nodesById.set(node._id, node);
+    nodesByPath.set(node.path, node);
+  }
+
+  for (const node of toUpdate) {
+    if (node.path === "") {
+      mutateValue = node.value as unknown as T;
+    } else {
+      const asInternal = node as Partial<StringNodeInternal>;
+      const internal =
+        asInternal._id !== undefined
+          ? nodesById.get(asInternal._id)
+          : nodesByPath.get(node.path);
+      if (internal) {
+        applyUpdateAtPath(mutateValue, internal.pathParts, node.value);
+      }
+    }
+  }
+
+  return mutateValue;
+}
+
 export function createAnonymizer(
   replacer: ReplacerType,
   options?: { maxDepth?: number },
 ) {
+  const processor = getNodeProcessor(replacer);
+
   return <T>(data: T): T => {
-    let mutateValue = deepClone(data);
-    const nodes = extractStringNodes(mutateValue, {
-      maxDepth: options?.maxDepth,
-    });
-
-    const processor: StringNodeProcessor = Array.isArray(replacer)
-      ? (() => {
-          const replacers: [regex: RegExp, replace: string][] = replacer.map(
-            ({ pattern, type, replace }) => {
-              if (type != null && type !== "pattern")
-                throw new Error("Invalid anonymizer type");
-              return [
-                typeof pattern === "string"
-                  ? new RegExp(pattern, "g")
-                  : pattern,
-                replace ?? "[redacted]",
-              ];
-            },
-          );
-
-          if (replacers.length === 0) throw new Error("No replacers provided");
-          return {
-            maskNodes: (nodes: StringNode[]) => {
-              return nodes.reduce<StringNode[]>((memo, item) => {
-                const newValue = replacers.reduce((value, [regex, replace]) => {
-                  const result = value.replace(regex, replace);
-
-                  // make sure we reset the state of regex
-                  regex.lastIndex = 0;
-
-                  return result;
-                }, item.value);
-
-                if (newValue !== item.value) {
-                  memo.push({ ...item, value: newValue });
-                }
-
-                return memo;
-              }, []);
-            },
-          };
-        })()
-      : typeof replacer === "function"
-        ? {
-            maskNodes: (nodes: StringNode[]) =>
-              nodes.reduce<StringNode[]>((memo, item) => {
-                const newValue = replacer(item.value, item.path);
-                if (newValue !== item.value) {
-                  memo.push({ ...item, value: newValue });
-                }
-
-                return memo;
-              }, []),
-          }
-        : replacer;
-
-    // Build a lookup from _id to internal node for direct write-back.
-    const nodesById = new Map<number, StringNodeInternal>();
-    for (const node of nodes) {
-      nodesById.set(node._id, node);
-    }
-
-    const toUpdate = processor.maskNodes(nodes);
-    for (const node of toUpdate) {
-      if (node.path === "") {
-        mutateValue = node.value as unknown as T;
-      } else {
-        // Match by _id if available (built-in replacers propagate it from
-        // the input nodes), otherwise fall back to path matching.
-        const asInternal = node as Partial<StringNodeInternal>;
-        const internal =
-          asInternal._id !== undefined
-            ? nodesById.get(asInternal._id)
-            : nodes.find((n) => n.path === node.path);
-        if (internal) {
-          internal.parent[internal.key] = node.value;
-        }
-      }
-    }
-
-    return mutateValue;
+    return applyProcessor(deepClone(data), processor, options);
   };
 }
 
@@ -184,10 +288,10 @@ export const SECRET_PLACEHOLDER = "[SECRET_DETECTED]";
  * traced data (prompts, tool inputs/outputs, file contents, shell commands).
  *
  * Designed to favor *low false positives* over exhaustive coverage:
- *  - Provider rules are anchored to well-known key prefixes.
- *  - Structural rules only fire when a sensitive *name* (api_key, token,
- *    password, …) is paired with an assignment/separator, so ordinary code,
- *    UUIDs, and hashes are left intact.
+ *  - All rules are prefix-anchored to well-known token shapes (provider key
+ *    formats, JWT structure, PEM armor). No contextual/heuristic patterns.
+ *  - No "KEY=value" or "Authorization: Bearer" structural rules — those
+ *    generated false positives and couldn't be combined into a single regex.
  *
  * This is NOT a port of gitleaks/secretlint; pattern shapes are drawn from
  * those projects (and provider docs) as a reference only. Every rule sets an
@@ -199,38 +303,38 @@ export const SECRET_PLACEHOLDER = "[SECRET_DETECTED]";
 export const DEFAULT_SECRET_RULES: StringNodeRule[] = [
   // ── Provider API keys (prefix-anchored) ─────────────────────────────────
   // Anthropic
-  { pattern: /sk-ant-[A-Za-z0-9_-]{20,}/g, replace: SECRET_PLACEHOLDER },
+  { pattern: /\bsk-ant-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g, replace: SECRET_PLACEHOLDER },
   // OpenAI: project / service-account / admin keys, then legacy `sk-...`
   {
-    pattern: /sk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}/g,
+    pattern: /\bsk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g,
     replace: SECRET_PLACEHOLDER,
   },
-  { pattern: /sk-[A-Za-z0-9]{32,}/g, replace: SECRET_PLACEHOLDER },
+  { pattern: /\bsk-[A-Za-z0-9]{32,}(?![A-Za-z0-9])/g, replace: SECRET_PLACEHOLDER },
   // LangSmith (keys are multi-segment: lsv2_pt_<key>_<tail> — match the
   // full underscore-delimited tail so none of it leaks past the placeholder)
   {
-    pattern: /lsv2_(?:pt|sk)_[A-Za-z0-9]{32,}(?:_[A-Za-z0-9]+)*/g,
+    pattern: /\blsv2_(?:pt|sk)_[A-Za-z0-9]{32,}(?:_[A-Za-z0-9]+)*(?![A-Za-z0-9_])/g,
     replace: SECRET_PLACEHOLDER,
   },
-  { pattern: /ls__[A-Za-z0-9]{16,}/g, replace: SECRET_PLACEHOLDER },
+  { pattern: /\bls__[A-Za-z0-9]{16,}(?![A-Za-z0-9])/g, replace: SECRET_PLACEHOLDER },
   // GitHub personal access / app tokens
-  { pattern: /gh[pousr]_[A-Za-z0-9]{36,}/g, replace: SECRET_PLACEHOLDER },
-  { pattern: /github_pat_[A-Za-z0-9_]{82}/g, replace: SECRET_PLACEHOLDER },
+  { pattern: /\bgh[pousr]_[A-Za-z0-9]{36,}(?![A-Za-z0-9])/g, replace: SECRET_PLACEHOLDER },
+  { pattern: /\bgithub_pat_[A-Za-z0-9_]{82}(?![A-Za-z0-9_])/g, replace: SECRET_PLACEHOLDER },
   // GitLab personal access token
-  { pattern: /glpat-[A-Za-z0-9_-]{20,}/g, replace: SECRET_PLACEHOLDER },
+  { pattern: /\bglpat-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g, replace: SECRET_PLACEHOLDER },
   // AWS access key id (covers AKIA/ASIA/ABIA/ACCA/A3T* prefixes)
   {
     pattern: /\b(?:AKIA|ASIA|ABIA|ACCA|A3T[A-Z0-9])[0-9A-Z]{16}\b/g,
     replace: SECRET_PLACEHOLDER,
   },
   // Google API key + OAuth access token
-  { pattern: /AIza[0-9A-Za-z_-]{35}/g, replace: SECRET_PLACEHOLDER },
-  { pattern: /ya29\.[0-9A-Za-z_-]+/g, replace: SECRET_PLACEHOLDER },
+  { pattern: /\bAIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])/g, replace: SECRET_PLACEHOLDER },
+  { pattern: /\bya29\.[0-9A-Za-z_-]+(?![0-9A-Za-z_-])/g, replace: SECRET_PLACEHOLDER },
   // Slack tokens (bot/user + app-level) + incoming webhooks
-  { pattern: /xox[baprs]-[A-Za-z0-9-]{10,}/g, replace: SECRET_PLACEHOLDER },
-  { pattern: /xapp-\d-[A-Za-z0-9-]{10,}/g, replace: SECRET_PLACEHOLDER },
+  { pattern: /\bxox[baprs]-[A-Za-z0-9-]{10,}(?![A-Za-z0-9-])/g, replace: SECRET_PLACEHOLDER },
+  { pattern: /\bxapp-\d-[A-Za-z0-9-]{10,}(?![A-Za-z0-9-])/g, replace: SECRET_PLACEHOLDER },
   {
-    pattern: /https:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9/]+/g,
+    pattern: /\bhttps:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9/]+(?![A-Za-z0-9/])/g,
     replace: SECRET_PLACEHOLDER,
   },
   // Stripe
@@ -239,22 +343,22 @@ export const DEFAULT_SECRET_RULES: StringNodeRule[] = [
     replace: SECRET_PLACEHOLDER,
   },
   // npm
-  { pattern: /npm_[A-Za-z0-9]{36}/g, replace: SECRET_PLACEHOLDER },
+  { pattern: /\bnpm_[A-Za-z0-9]{36}(?![A-Za-z0-9])/g, replace: SECRET_PLACEHOLDER },
   // PyPI upload token
   {
-    pattern: /pypi-AgEIcHlwaS[A-Za-z0-9_-]{50,}/g,
+    pattern: /\bpypi-AgEIcHlwaS[A-Za-z0-9_-]{50,}(?![A-Za-z0-9_-])/g,
     replace: SECRET_PLACEHOLDER,
   },
   // SendGrid
   {
-    pattern: /SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}/g,
+    pattern: /\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])/g,
     replace: SECRET_PLACEHOLDER,
   },
 
   // ── Structured tokens ────────────────────────────────────────────────────
   // JWT (header.payload.signature)
   {
-    pattern: /eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g,
+    pattern: /\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?![A-Za-z0-9_-])/g,
     replace: SECRET_PLACEHOLDER,
   },
   // PEM private key blocks (RSA/EC/OPENSSH/DSA/plain + PGP "...KEY BLOCK")
@@ -263,40 +367,52 @@ export const DEFAULT_SECRET_RULES: StringNodeRule[] = [
       /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY(?: BLOCK)?-----[\s\S]+?-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY(?: BLOCK)?-----/g,
     replace: SECRET_PLACEHOLDER,
   },
-
-  // ── Structural / contextual (sensitive NAME + assignment) ─────────────────
-  // KEY=value or "key": "value" where the name looks sensitive. Keep the name
-  // and separator ($1), redact the value. Notes:
-  //  - (?![A-Za-z0-9]) after the keyword requires a component boundary, so
-  //    `token` matches `api_token`/`mytoken` but NOT `tokenizer`/`tokens`.
-  //  - the value may start with an auth scheme word (Bearer/Token/Basic) so a
-  //    `X-Api-Key: Bearer <tok>` shape redacts the credential, not just "Bearer".
-  //  - value excludes & and ; so query-string params past the secret survive.
-  //  - requires a 6+ char value so short non-secret values are not touched.
-  {
-    pattern:
-      /\b([A-Za-z0-9_.-]*(?:API[_-]?KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE[_-]?KEY|ACCESS[_-]?KEY|AUTH[_-]?TOKEN|CLIENT[_-]?SECRET)(?![A-Za-z0-9])(?:[_.-][A-Za-z0-9]+)*["']?\s*[:=]\s*["']?)(?:(?:bearer|token|basic)\s+)?[^\s"'&;]{6,}/gi,
-    replace: `$1${SECRET_PLACEHOLDER}`,
-  },
-  // Authorization / API-key headers. Keep the header name + separator ($1$2)
-  // and an optional scheme ($3); redact the credential.
-  {
-    pattern:
-      /\b(authorization|x-api-key|x-auth-token)(["']?\s*[:=]\s*["']?)(bearer\s+|token\s+|basic\s+)?[A-Za-z0-9._~+/-]{8,}=*/gi,
-    replace: `$1$2$3${SECRET_PLACEHOLDER}`,
-  },
-  // Bare "Bearer <token>" (any case; the scheme word is preserved via $1).
-  {
-    pattern: /\b(Bearer\s+)[A-Za-z0-9._~+/-]{10,}=*/gi,
-    replace: `$1${SECRET_PLACEHOLDER}`,
-  },
-  // Credentials embedded in URLs: proto://user:PASS@host -> redact PASS only.
-  // Username is optional so proto://:PASS@host (empty user) is still covered.
-  {
-    pattern: /\b([a-z][a-z0-9+.-]*:\/\/[^:@/\s]*:)[^@/\s]+(@)/gi,
-    replace: `$1${SECRET_PLACEHOLDER}$2`,
-  },
 ];
+
+const SECRET_RULE_PREFILTER = new RegExp(
+  [
+    "sk-",
+    "lsv2_",
+    "ls__",
+    "gh[pousr]_",
+    "github_pat_",
+    "glpat-",
+    "AKIA",
+    "ASIA",
+    "ABIA",
+    "ACCA",
+    "A3T[A-Z0-9]",
+    "AIza",
+    "ya29\\.",
+    "xox[baprs]-",
+    "xapp-\\d-",
+    "hooks\\.slack\\.com/services",
+    "(?:sk|rk)_(?:live|test)_",
+    "npm_",
+    "pypi-AgEIcHlwaS",
+    "SG\\.",
+    "eyJ",
+    "-----BEGIN",
+  ].join("|"),
+  "i",
+);
+
+// Threshold for base64 detection: strings longer than this that are almost
+// entirely base64 characters (with optional whitespace) are treated as binary
+// blobs and skipped. 100 chars is conservative — real secrets are short and
+// contain distinctive prefixes that never look like base64.
+const BASE64_MIN_LENGTH = 100;
+const BASE64_RE = /^[A-Za-z0-9+/\s]+={0,2}$/;
+
+export function isLikelyBase64(value: string): boolean {
+  if (value.length < BASE64_MIN_LENGTH) return false;
+  return BASE64_RE.test(value);
+}
+
+function secretPrefilter(value: string): boolean {
+  if (isLikelyBase64(value)) return false;
+  return SECRET_RULE_PREFILTER.test(value);
+}
 
 /**
  * Build an anonymizer pre-loaded with {@link DEFAULT_SECRET_RULES} suitable for
@@ -320,6 +436,31 @@ export function createSecretAnonymizer(options?: {
   extraRules?: StringNodeRule[];
   maxDepth?: number;
 }) {
-  const rules = [...DEFAULT_SECRET_RULES, ...(options?.extraRules ?? [])];
-  return createAnonymizer(rules, { maxDepth: options?.maxDepth ?? 24 });
+  const extraRules = options?.extraRules ?? [];
+  const maxDepth = options?.maxDepth ?? 24;
+
+  if (extraRules.length > 0) {
+    // When extra rules are provided, use the node-based pipeline without the
+    // prefilter — custom rules may match patterns that don't contain standard
+    // secret indicators.
+    const processor = createRuleNodeProcessor([
+      ...DEFAULT_SECRET_RULES,
+      ...extraRules,
+    ]);
+    return <T>(data: T): T => {
+      return applyProcessor(deepClone(data), processor, { maxDepth });
+    };
+  }
+
+  // Default path: use the node-based pipeline with the pre-skip prefilter.
+  // The prefilter skips large base64 blobs (the dominant performance cost)
+  // and short-circuits strings with no secret indicators, so regex only
+  // runs on text fields that might actually contain a secret.
+  const processor = createRuleNodeProcessor(DEFAULT_SECRET_RULES, {
+    prefilter: secretPrefilter,
+  });
+
+  return <T>(data: T): T => {
+    return applyProcessor(deepClone(data), processor, { maxDepth });
+  };
 }

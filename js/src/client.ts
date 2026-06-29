@@ -82,6 +82,7 @@ import { assertUuid } from "./utils/_uuid.js";
 import { warnOnce } from "./utils/warn.js";
 import { _MIN_BACKEND_VERSION } from "./utils/constants.js";
 import { parseHubIdentifier } from "./utils/prompts.js";
+import { createSecretAnonymizer } from "./anonymizer/index.js";
 import {
   raiseForStatus,
   isLangSmithNotFoundError,
@@ -159,6 +160,25 @@ export interface ClientConfig {
   timeout_ms?: number;
   webUrl?: string;
   anonymizer?: (values: KVMap) => KVMap | Promise<KVMap>;
+  /**
+   * Whether to redact detected secrets from traced data before sending to
+   * the API.
+   *
+   * If `true` (the default), the client automatically applies
+   * `createSecretAnonymizer()` to run inputs, outputs, and metadata,
+   * replacing detected API keys, tokens, and private keys with
+   * `[SECRET_DETECTED]`.
+   *
+   * Set to `false` to disable automatic secret redaction (i.e., opt in to
+   * sending raw values).
+   *
+   * Can also be configured via the `LANGSMITH_REDACT_SECRETS` environment
+   * variable (set to `"false"` to disable).
+   *
+   * If a custom `anonymizer` is provided, it takes precedence and
+   * `redactSecrets` has no effect.
+   */
+  redactSecrets?: boolean;
   hideInputs?: boolean | ((inputs: KVMap) => KVMap | Promise<KVMap>);
   hideOutputs?: boolean | ((outputs: KVMap) => KVMap | Promise<KVMap>);
   hideMetadata?: boolean | ((metadata: KVMap) => KVMap | Promise<KVMap>);
@@ -1261,11 +1281,41 @@ export class Client implements LangSmithTracingClientInterface {
       debug: config.debug ?? this.debug,
     });
 
+    // Secret redaction is on by default. Users can opt out by setting
+    // redactSecrets: false or LANGSMITH_REDACT_SECRETS=false.
+    // If a custom anonymizer is provided, it takes precedence. If the user
+    // explicitly sets hideInputs/hideOutputs/hideMetadata, the default secret
+    // anonymizer is not applied so their custom filters are respected.
+    const redactSecrets =
+      config.redactSecrets ??
+      getLangSmithEnvironmentVariable("REDACT_SECRETS") !== "false";
+    const noExplicitHide =
+      config.hideInputs === undefined &&
+      config.hideOutputs === undefined &&
+      config.hideMetadata === undefined;
+    const defaultSecretAnonymizer =
+      config.anonymizer ??
+      (redactSecrets && noExplicitHide ? createSecretAnonymizer() : undefined);
+
+    // Env-var hide flags (defaultConfig.*) take priority over the default
+    // secret anonymizer: if HIDE_INPUTS=true, inputs are fully hidden rather
+    // than redacted. The anonymizer still applies to fields whose env flag
+    // is not set, matching the Python SDK behavior.
     this.hideInputs =
-      config.hideInputs ?? config.anonymizer ?? defaultConfig.hideInputs;
+      config.hideInputs ??
+      (defaultConfig.hideInputs === true
+        ? true
+        : (defaultSecretAnonymizer ?? defaultConfig.hideInputs));
     this.hideOutputs =
-      config.hideOutputs ?? config.anonymizer ?? defaultConfig.hideOutputs;
-    this.hideMetadata = config.hideMetadata ?? defaultConfig.hideMetadata;
+      config.hideOutputs ??
+      (defaultConfig.hideOutputs === true
+        ? true
+        : (defaultSecretAnonymizer ?? defaultConfig.hideOutputs));
+    this.hideMetadata =
+      config.hideMetadata ??
+      (defaultConfig.hideMetadata === true
+        ? true
+        : (defaultSecretAnonymizer ?? defaultConfig.hideMetadata));
 
     this.omitTracedRuntimeInfo = config.omitTracedRuntimeInfo ?? false;
 
@@ -1545,7 +1595,11 @@ export class Client implements LangSmithTracingClientInterface {
     if (runParams.outputs !== undefined) {
       runParams.outputs = await this.processOutputs(runParams.outputs);
     }
-    if (runParams.extra != null && "metadata" in runParams.extra) {
+    if (
+      runParams.extra != null &&
+      "metadata" in runParams.extra &&
+      runParams.extra.metadata != null
+    ) {
       runParams.extra = {
         ...runParams.extra,
         metadata: await this.processMetadata(runParams.extra.metadata),
@@ -2671,7 +2725,11 @@ export class Client implements LangSmithTracingClientInterface {
     if (run.outputs) {
       run.outputs = await this.processOutputs(run.outputs);
     }
-    if (run.extra != null && "metadata" in run.extra) {
+    if (
+      run.extra != null &&
+      "metadata" in run.extra &&
+      run.extra.metadata != null
+    ) {
       run.extra = {
         ...run.extra,
         metadata: await this.processMetadata(run.extra.metadata),
