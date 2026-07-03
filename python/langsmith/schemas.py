@@ -86,7 +86,7 @@ class ExampleBase(BaseModel):
     outputs: Optional[dict[str, Any]] = Field(default=None)
     metadata: Optional[dict[str, Any]] = Field(default=None)
 
-    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True, defer_build=True)
 
 
 class _AttachmentDict(TypedDict):
@@ -101,6 +101,8 @@ _AttachmentLike = Union[
 
 class ExampleCreate(BaseModel):
     """Example upload with attachments."""
+
+    model_config = ConfigDict(defer_build=True)
 
     id: Optional[UUID] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -188,6 +190,7 @@ class AttachmentsOperations(BaseModel):
     )
 
 
+    model_config = ConfigDict(defer_build=True)
 class ExampleUpdate(BaseModel):
     """Example update with attachments."""
 
@@ -200,7 +203,7 @@ class ExampleUpdate(BaseModel):
     attachments: Optional[Attachments] = None
     attachments_operations: Optional[AttachmentsOperations] = None
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, defer_build=True)
 
     def __init__(self, **data):
         """Initialize from dict."""
@@ -225,7 +228,7 @@ class DatasetBase(BaseModel):
     description: Optional[str] = None
     data_type: Optional[DataType] = None
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, defer_build=True)
 
 
 DatasetTransformationType = Literal[
@@ -294,6 +297,8 @@ class Dataset(DatasetBase):
 
 class DatasetVersion(BaseModel):
     """Class representing a dataset version."""
+
+    model_config = ConfigDict(defer_build=True)
 
     tags: Optional[list[str]] = None
     as_of: datetime
@@ -387,7 +392,7 @@ class RunBase(BaseModel):
         """Return a string representation of the RunBase object."""
         return f"{self.__class__}(id={self.id}, name='{self.name}', run_type='{self.run_type}')"
 
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    model_config = ConfigDict(arbitrary_types_allowed=True, defer_build=True)
 
 
 class Run(RunBase):
@@ -580,6 +585,7 @@ class FeedbackSourceBase(BaseModel):
     This represents whether feedback is submitted from the API, model, human labeler,
         etc.
     """
+    model_config = ConfigDict(defer_build=True)
 
     type: str
     """The type of the feedback source."""
@@ -650,7 +656,7 @@ class FeedbackBase(BaseModel):
     extra: Optional[dict] = None
     """The metadata of the feedback."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, defer_build=True)
 
 
 class FeedbackCategory(TypedDict, total=False):
@@ -705,6 +711,7 @@ class TracerSession(BaseModel):
 
     Sessions are also referred to as "Projects" in the UI.
     """
+    model_config = ConfigDict(defer_build=True)
 
     id: UUID
     """The ID of the project."""
@@ -842,6 +849,7 @@ class AnnotationQueue(BaseModel):
 
     id: UUID
     """The unique identifier of the annotation queue."""
+    model_config = ConfigDict(defer_build=True)
     name: str
     """The name of the annotation queue."""
     description: Optional[str] = None
@@ -883,6 +891,7 @@ class LangSmithInfo(BaseModel):
 
     version: str = ""
     """The version of the LangSmith server."""
+    model_config = ConfigDict(defer_build=True)
     license_expiration_time: Optional[datetime] = None
     """The time the license will expire."""
     batch_ingest_config: Optional[BatchIngestConfig] = None
@@ -890,7 +899,6 @@ class LangSmithInfo(BaseModel):
     instance_flags: Optional[dict[str, Any]] = None
 
 
-Example.model_rebuild()
 
 
 class LangSmithSettings(BaseModel):
@@ -898,6 +906,7 @@ class LangSmithSettings(BaseModel):
 
     id: str
     """The ID of the tenant."""
+    model_config = ConfigDict(defer_build=True)
     display_name: str
     """The display name of the tenant."""
     created_at: datetime
@@ -910,6 +919,7 @@ class FeedbackIngestToken(BaseModel):
 
     id: UUID
     """The ID of the feedback ingest token."""
+    model_config = ConfigDict(defer_build=True)
     url: str
     """The URL to GET when logging the feedback."""
     expires_at: datetime
@@ -943,6 +953,7 @@ class DatasetDiffInfo(BaseModel):
 
     examples_modified: list[UUID]
     """A list of UUIDs representing the modified examples."""
+    model_config = ConfigDict(defer_build=True)
     examples_added: list[UUID]
     """A list of UUIDs representing the added examples."""
     examples_removed: list[UUID]
@@ -955,6 +966,7 @@ class ComparativeExperiment(BaseModel):
     This information summarizes evaluation results comparing
     two or more models on a given dataset.
     """
+    model_config = ConfigDict(defer_build=True)
 
     id: UUID
     """The unique identifier for the comparative experiment."""
@@ -992,6 +1004,7 @@ class PromptCommit(BaseModel):
 
     owner: str
     """The handle of the owner of the prompt."""
+    model_config = ConfigDict(defer_build=True)
     repo: str
     """The name of the prompt."""
     commit_hash: str
@@ -1013,6 +1026,7 @@ class ListedPromptCommit(BaseModel):
 
     id: UUID
     """The unique identifier for the prompt commit."""
+    model_config = ConfigDict(defer_build=True)
 
     owner: str
     """The owner of the prompt commit."""
@@ -1059,6 +1073,7 @@ class Prompt(BaseModel):
 
     repo_handle: str
     """The name of the prompt."""
+    model_config = ConfigDict(defer_build=True)
     description: Optional[str] = None
     """The description of the prompt."""
     readme: Optional[str] = None
@@ -1108,6 +1123,7 @@ class ListPromptsResponse(BaseModel):
 
     repos: list[Prompt]
     """The list of prompts."""
+    model_config = ConfigDict(defer_build=True)
     total: int
     """The total number of prompts."""
 
@@ -1418,6 +1434,7 @@ class ExperimentResults(TypedDict):
 
 
 class InsightsReport(BaseModel):
+    model_config = ConfigDict(defer_build=True)
     """An Insights Report created by the Insights Agent over a tracing project."""
 
     id: UUID | str
@@ -1644,6 +1661,7 @@ class FeedbackFormulaWeightedVariable(BaseModel):
     key: Annotated[str, Field(min_length=1)]
 
 
+    model_config = ConfigDict(defer_build=True)
 class FeedbackFormulaCreate(BaseModel):
     """Schema used for creating a feedback formula."""
 
@@ -1656,6 +1674,7 @@ class FeedbackFormulaCreate(BaseModel):
     )
 
 
+    model_config = ConfigDict(defer_build=True)
 class FeedbackFormulaUpdate(BaseModel):
     """Schema used for updating a feedback formula."""
 
@@ -1666,6 +1685,7 @@ class FeedbackFormulaUpdate(BaseModel):
     )
 
 
+    model_config = ConfigDict(defer_build=True)
 class FeedbackFormula(FeedbackFormulaCreate):
     """Schema for getting feedback formulas."""
 
