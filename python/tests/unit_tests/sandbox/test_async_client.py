@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from pytest_httpx import HTTPXMock
 
+from langsmith import utils as ls_utils
 from langsmith.sandbox import (
     AsyncSandboxClient,
     AsyncServiceURL,
@@ -81,6 +82,18 @@ class TestAsyncSandboxClientInit:
         )
         assert client._http.headers.get("X-Api-Key") == "test-key"
         await client.aclose()
+
+    async def test_rejects_registry_api_key_over_remote_http(self):
+        """Test registry OpenAPI endpoints cannot use remote HTTP API keys."""
+        client = AsyncSandboxClient(
+            api_endpoint="HTTP://example.com:8080",
+            api_key="test-key",
+        )
+        try:
+            with pytest.raises(ls_utils.LangSmithUserError, match="Insecure API URL"):
+                client.registries
+        finally:
+            await client.aclose()
 
     async def test_api_key_from_environment(self):
         """Test API key from environment variable."""

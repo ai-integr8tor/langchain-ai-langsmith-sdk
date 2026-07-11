@@ -264,6 +264,8 @@ class SandboxClient:
             )
         """
         if self._registries_client is None:
+            auth_value = self._api_key or ("headers" if self._default_headers else None)
+            ls_utils._validate_insecure_transport(self._api_root(), auth_value)
             self._registries_client = Langsmith(
                 api_key=self._api_key,
                 base_url=self._api_root(),

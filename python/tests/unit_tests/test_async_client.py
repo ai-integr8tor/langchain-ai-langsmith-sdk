@@ -31,6 +31,15 @@ def _clear_profile_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(key, raising=False)
 
 
+async def test_async_client_rejects_openapi_credentials_over_remote_http() -> None:
+    client = AsyncClient(api_url="HTTP://example.com:1984", api_key="test-api-key")
+    try:
+        with pytest.raises(ls_utils.LangSmithUserError, match="Insecure API URL"):
+            client.runs
+    finally:
+        await client.aclose()
+
+
 @mock.patch("langsmith.async_client.httpx.AsyncClient")
 def test_async_client_custom_headers(mock_client_cls: mock.Mock) -> None:
     mock_httpx_client = mock.Mock()

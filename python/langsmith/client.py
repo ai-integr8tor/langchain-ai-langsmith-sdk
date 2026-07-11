@@ -708,6 +708,7 @@ def _get_write_api_urls(_write_api_urls: Optional[dict[str, str]]) -> dict[str, 
         processed_url = processed_url.strip().strip('"').strip("'").rstrip("/")
         processed_api_key = api_key.strip().strip('"').strip("'")
         _validate_api_key_if_hosted(processed_url, processed_api_key)
+        ls_utils._validate_insecure_transport(processed_url, processed_api_key)
         processed_write_api_urls[processed_url] = processed_api_key
 
     return processed_write_api_urls
@@ -1474,6 +1475,17 @@ class Client:
 
     def _get_langsmith_api(self) -> LangsmithOpenAPIClient:
         if self._langsmith_api is None:
+            auth_value = (
+                self.api_key
+                or self._oauth_access_token
+                or (
+                    "profile-auth"
+                    if self._profile_auth is not None and self._profile_auth.has_auth
+                    else None
+                )
+                or (str(self._workspace_id) if self._workspace_id else None)
+            )
+            ls_utils._validate_insecure_transport(self.api_url, auth_value)
             self._langsmith_api = LangsmithOpenAPIClient(
                 api_key=self._api_key,
                 tenant_id=str(self._workspace_id) if self._workspace_id else None,
