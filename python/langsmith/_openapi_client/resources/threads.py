@@ -39,8 +39,6 @@ class ThreadsResource(SyncAPIResource):
         """
         This property can be used as a prefix for any HTTP method call to return
         the raw response object instead of the parsed content.
-
-        For more information, see https://www.github.com/stainless-sdks/langchain-python#accessing-raw-response-data-eg-headers
         """
         return ThreadsResourceWithRawResponse(self)
 
@@ -48,8 +46,6 @@ class ThreadsResource(SyncAPIResource):
     def with_streaming_response(self) -> ThreadsResourceWithStreamingResponse:
         """
         An alternative to `.with_raw_response` that doesn't eagerly read the response body.
-
-        For more information, see https://www.github.com/stainless-sdks/langchain-python#with_streaming_response
         """
         return ThreadsResourceWithStreamingResponse(self)
 
@@ -182,10 +178,10 @@ class ThreadsResource(SyncAPIResource):
               for syntax.
 
           max_start_time: `max_start_time` is the exclusive upper bound on thread activity (RFC3339
-              date-time).
+              date-time). Defaults to now (UTC) when omitted.
 
           min_start_time: `min_start_time` is the inclusive lower bound on thread activity (RFC3339
-              date-time).
+              date-time). Defaults to 1 day before now (UTC) when omitted.
 
           page_size: `page_size` is the maximum number of threads to return in this response.
               Defaults to 20 when omitted; must be between 1 and 100 inclusive when set. The
@@ -249,6 +245,7 @@ class ThreadsResource(SyncAPIResource):
             ]
         ],
         session_id: str,
+        filter: str | Omit = omit,
         # Use the following arguments if you need to pass additional parameters to the API that aren't available via kwargs.
         # The extra values given here take precedence over values defined on the client or passed to this method.
         extra_headers: Headers | None = None,
@@ -267,6 +264,12 @@ class ThreadsResource(SyncAPIResource):
               `SingleThreadStatsSelectField`.
 
           session_id: `session_id` is the tracing project (session) UUID (required).
+
+          filter: `filter` narrows which of the thread's traces are aggregated, using a LangSmith
+              filter expression. For example: lt(start_time, "2025-01-01T00:00:00Z") or
+              eq(trace_id, "0190a1b2-c3d4-7ef0-a5b6-6ea3a82e9328"). See
+              https://docs.langchain.com/langsmith/trace-query-syntax#filter-query-language
+              for syntax.
 
           extra_headers: Send extra headers
 
@@ -289,6 +292,7 @@ class ThreadsResource(SyncAPIResource):
                     {
                         "selects": selects,
                         "session_id": session_id,
+                        "filter": filter,
                     },
                     thread_stats_params.ThreadStatsParams,
                 ),
@@ -303,8 +307,6 @@ class AsyncThreadsResource(AsyncAPIResource):
         """
         This property can be used as a prefix for any HTTP method call to return
         the raw response object instead of the parsed content.
-
-        For more information, see https://www.github.com/stainless-sdks/langchain-python#accessing-raw-response-data-eg-headers
         """
         return AsyncThreadsResourceWithRawResponse(self)
 
@@ -312,8 +314,6 @@ class AsyncThreadsResource(AsyncAPIResource):
     def with_streaming_response(self) -> AsyncThreadsResourceWithStreamingResponse:
         """
         An alternative to `.with_raw_response` that doesn't eagerly read the response body.
-
-        For more information, see https://www.github.com/stainless-sdks/langchain-python#with_streaming_response
         """
         return AsyncThreadsResourceWithStreamingResponse(self)
 
@@ -446,10 +446,10 @@ class AsyncThreadsResource(AsyncAPIResource):
               for syntax.
 
           max_start_time: `max_start_time` is the exclusive upper bound on thread activity (RFC3339
-              date-time).
+              date-time). Defaults to now (UTC) when omitted.
 
           min_start_time: `min_start_time` is the inclusive lower bound on thread activity (RFC3339
-              date-time).
+              date-time). Defaults to 1 day before now (UTC) when omitted.
 
           page_size: `page_size` is the maximum number of threads to return in this response.
               Defaults to 20 when omitted; must be between 1 and 100 inclusive when set. The
@@ -513,6 +513,7 @@ class AsyncThreadsResource(AsyncAPIResource):
             ]
         ],
         session_id: str,
+        filter: str | Omit = omit,
         # Use the following arguments if you need to pass additional parameters to the API that aren't available via kwargs.
         # The extra values given here take precedence over values defined on the client or passed to this method.
         extra_headers: Headers | None = None,
@@ -531,6 +532,12 @@ class AsyncThreadsResource(AsyncAPIResource):
               `SingleThreadStatsSelectField`.
 
           session_id: `session_id` is the tracing project (session) UUID (required).
+
+          filter: `filter` narrows which of the thread's traces are aggregated, using a LangSmith
+              filter expression. For example: lt(start_time, "2025-01-01T00:00:00Z") or
+              eq(trace_id, "0190a1b2-c3d4-7ef0-a5b6-6ea3a82e9328"). See
+              https://docs.langchain.com/langsmith/trace-query-syntax#filter-query-language
+              for syntax.
 
           extra_headers: Send extra headers
 
@@ -553,6 +560,7 @@ class AsyncThreadsResource(AsyncAPIResource):
                     {
                         "selects": selects,
                         "session_id": session_id,
+                        "filter": filter,
                     },
                     thread_stats_params.ThreadStatsParams,
                 ),
